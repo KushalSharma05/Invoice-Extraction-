@@ -1,156 +1,152 @@
-import fitz  # PyMuPDF
 import cv2
-import numpy as np
 import json
-import requests
-import base64
-import tempfile
+import ollama
+import re
+from typing import Optional, Dict, Any
+from PIL import Image
 import os
 import logging
 
-# -----------------------------
-# Logging
-# -----------------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # -----------------------------
-# Functions
+# LOGGING CONFIG
 # -----------------------------
+logging.basicConfig(
+    level=logging.INFO,  # change to DEBUG for very detailed logs
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
-def sharpen_image(image):
-    """Sharpen an OpenCV image."""
-    logging.info('Sharpening image')
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]])
-    return cv2.filter2D(image, -1, kernel)
 
-def pix_to_cv2(pix):
-    """Convert PyMuPDF pixmap to OpenCV BGR image."""
-    logging.info('Converting pixmap to OpenCV image')
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-    if pix.n == 4:  # BGRA to BGR
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    elif pix.n == 1:  # Grayscale to BGR
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    return img
+# -----------------------------
+# Robust JSON Extractor
+# -----------------------------
+def _robust_json_extractor(text: str) -> Optional[Dict[str, Any]]:
+    """
+    More robustly extracts a JSON object from a string, handling markdown fences and extra text.
+    """
+    # Remove ```json fences
+    text = re.sub(r"^```json\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
 
-def run_ollama_model(image_path):
-    """Send image to Ollama API and return JSON string."""
-    logging.info(f'Running Ollama model on image: {image_path}')
-    with open(image_path, "rb") as f:
-        base64_image = base64.b64encode(f.read()).decode('utf-8')
+    # Find JSON object in text
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        logger.error("❌ JSON EXTRACTION FAILED: No JSON object found in the text.")
+        return None
 
-    prompt = (
-        "Extract the following fields from this image as JSON. "
-        "If a field is missing, return an empty string. "
-        "Fields: supplier_name, gateentry_no, po_no, vehicle_no, po_date, invoice_no, "
-        "invoice_date, challan_no, challan_date, material_name, material_unit, challan_qty, "
-        "material_rate, gst_no, ewaybill_no, ewaybill_date, lr_no, lr_date, plant_no."
+    json_str = match.group(0)
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        logger.error(f"⚠️ JSON DECODE ERROR: {e}. Problematic string: {json_str}")
+        return None
+
+
+# -----------------------------
+# STEP 1: Preprocess Image
+# -----------------------------
+def preprocess_image(input_path: str, output_path: str, dpi: int = 600, scale: int = 3):
+    """
+    Preprocess the image for better OCR/vision model accuracy.
+    - Converts to grayscale
+    - Sharpens text
+    - Upscales for virtual high DPI
+    - Saves with embedded DPI metadata
+    """
+    logger.info(f"Reading input image: {input_path}")
+    image = cv2.imread(input_path)
+    if image is None:
+        logger.error(f"❌ Could not read image: {input_path}")
+        raise FileNotFoundError(f"Could not read image: {input_path}")
+
+    # Convert to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Apply unsharp masking
+    gaussian = cv2.GaussianBlur(gray, (9, 9), 10)
+    sharpened = cv2.addWeighted(gray, 1.5, gaussian, -0.5, 0)
+
+    # Upscale for virtual high DPI
+    width = int(sharpened.shape[1] * scale)
+    height = int(sharpened.shape[0] * scale)
+    high_res = cv2.resize(sharpened, (width, height), interpolation=cv2.INTER_CUBIC)
+
+    temp_path = output_path.replace(".png", "_temp.png")
+    cv2.imwrite(temp_path, high_res)
+
+    # Save with DPI metadata
+    img = Image.open(temp_path)
+    img.save(output_path, dpi=(dpi, dpi))
+
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+
+    logger.info(f"✅ Processed image saved at {output_path} with {dpi} DPI")
+
+
+# -----------------------------
+# STEP 2: Query Llama Vision (One Go)
+# -----------------------------
+def extract_fields(image_path: str) -> dict:
+    """
+    Extracts all required fields in one go from the invoice using Llama 3.2 Vision.
+    Returns a dictionary.
+    """
+    prompt = """
+    You are an OCR and data extraction assistant.
+    Extract the following fields from the invoice and return ONLY a valid JSON object:
+
+    {
+        "invoice_no": "",
+        "ewaybill_no": "",
+        "po_no": "",
+        "gst_no": "",
+        "quantity": "",
+        "supplier_name": "",
+        "consignee_details": "",
+        "supplier_address": ""
+    }
+    """
+
+    logger.info("📤 Sending single extraction request to Llama Vision")
+    response = ollama.chat(
+        model="llama3.2-vision:latest",
+        messages=[
+            {"role": "user", "content": prompt, "images": [image_path]}
+        ]
     )
 
-    try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "qwen2.5vl:7b",
-                "prompt": prompt,
-                "images": [base64_image],
-                "stream": False
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-        if 'response' not in data:
-            logging.warning(f"No 'response' key in API output: {data}")
-            return "{}"
-        logging.info("Model call successful")
-        return data['response']
-    except Exception as e:
-        logging.error(f"Ollama API call failed: {e}")
-        return "{}"
+    raw_output = response["message"]["content"]
+    logger.debug(f"Raw model output: {raw_output}")
+
+    extracted = _robust_json_extractor(raw_output)
+    if extracted:
+        logger.info("✅ Successfully extracted JSON fields")
+        return extracted
+    else:
+        return {"error": "Invalid JSON returned by model", "raw_output": raw_output}
+
 
 # -----------------------------
-# Main PDF Processing
-# -----------------------------
-
-def process_pdf(pdf_path, output_json_path='merged_results.json'):
-    if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
-    logging.info(f"Opening PDF: {pdf_path}")
-    doc = fitz.open(pdf_path)
-    merged_results = []
-
-    for page_num in range(len(doc)):
-        logging.info(f"Processing page {page_num + 1}/{len(doc)}")
-        page = doc.load_page(page_num)
-
-        # Render page at 400 dpi
-        zoom = 400 / 72
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-
-        # Convert and sharpen
-        cv_img = pix_to_cv2(pix)
-        sharp_img = sharpen_image(cv_img)
-
-        # Save temp image
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmpfile:
-            temp_path = tmpfile.name
-            cv2.imwrite(temp_path, sharp_img)
-            logging.info(f"Saved temporary image: {temp_path}")
-
-        # Run model
-        json_str = run_ollama_model(temp_path)
-        logging.info(f"Raw model output: {json_str}")
-
-        # Parse JSON safely
-        try:
-            json_data = json.loads(json_str)
-        except json.JSONDecodeError:
-            logging.warning(f"Failed to parse JSON for page {page_num + 1}")
-            json_data = {}
-
-        merged_results.append(json_data)
-
-        # Remove temp image
-        os.remove(temp_path)
-        logging.info(f"Removed temporary image: {temp_path}")
-
-    # Merge JSONs into one clean object
-    fields = [
-        "supplier_name", "gateentry_no", "po_no", "vehicle_no", "po_date", "invoice_no",
-        "invoice_date", "challan_no", "challan_date", "material_name", "material_unit",
-        "challan_qty", "material_rate", "gst_no", "ewaybill_no", "ewaybill_date",
-        "lr_no", "lr_date", "plant_no"
-    ]
-
-    # Remove duplicates in fields
-    unique_fields = list(dict.fromkeys(fields))
-    merged_json = {}
-
-    logging.info("Merging results from all pages")
-    for field in unique_fields:
-        values = [res.get(field, "") for res in merged_results if res.get(field)]
-        if len(values) == 1:
-            merged_json[field] = values[0]
-        elif len(values) > 1:
-            merged_json[field] = values
-        else:
-            merged_json[field] = ""
-
-    # Save final JSON
-    with open(output_json_path, "w") as f:
-        json.dump(merged_json, f, indent=4)
-    logging.info(f"Merged JSON saved: {output_json_path}")
-
-    return merged_json
-
-# -----------------------------
-# Example usage
+# MAIN EXECUTION
 # -----------------------------
 if __name__ == "__main__":
-    pdf_path = "1054_20250913_ea51.pdf"  # Replace with your PDF
-    result = process_pdf(pdf_path)
-    print(json.dumps(result, indent=4))
+    input_img = r"D:\C Drive Data_27-06-2025\Desktop\abc1.png"
+    output_img = r"D:\C Drive Data_27-06-2025\Desktop\abc1_processed.png"
+
+    try:
+        # Preprocess
+        preprocess_image(input_img, output_img, dpi=600, scale=3)
+
+        # Extract fields in one go
+        results = extract_fields(output_img)
+
+        # Save results
+        with open("extracted_fields.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=4, ensure_ascii=False)
+
+        logger.info("✅ Extraction completed. Results saved to extracted_fields.json")
+
+    except Exception as e:
+        logger.exception(f"❌ Fatal error: {e}")
